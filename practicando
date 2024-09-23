@@ -1,0 +1,107 @@
+{-# LANGUAGE DataKinds           #-}
+{-# LANGUAGE NoImplicitPrelude   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE DeriveAnyClass      #-}
+{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE TypeApplications    #-}
+
+module AgroIndustryContract where
+
+import           Plutus.Contract
+import           PlutusTx.Prelude
+import           Ledger
+import           Ledger.Constraints as Constraints
+import           Ledger.Ada as Ada
+import           Ledger.Typed.Scripts
+import           Playground.Contract
+import           Text.Printf (printf)
+import           Prelude (String, Show, Eq)
+
+-- Definición de datos de producto
+data Product = Product
+    { productName        :: String
+    , productPrice       :: Integer  -- Precio del producto en lovelaces (1 ADA = 1,000,000 lovelaces)
+    , productQuantity    :: Integer  -- Cantidad disponible
+    , productVerified    :: Bool     -- Verificación de calidad
+    } deriving (Show, Eq)
+
+-- Definición de las dos partes involucradas: vendedor y comprador
+data AgroIndustryParams = AgroIndustryParams
+    { buyerAddress   :: PubKeyHash
+    , sellerAddress  :: PubKeyHash
+    , productDetails :: Product
+    }
+
+-- Estado del contrato para validar transacciones
+{-# INLINABLE mkAgroIndustryValidator #-}
+mkAgroIndustryValidator :: AgroIndustryParams -> () -> () -> ScriptContext -> Bool
+mkAgroIndustryValidator params _ _ ctx = 
+    traceIfFalse "No se han cumplido las condiciones del contrato" allConditionsMet
+  where
+    -- Verifica que ambas partes (comprador y vendedor) estén correctas
+    info :: TxInfo
+    info = scriptContextTxInfo ctx
+
+    buyerPaid :: Bool
+    buyerPaid = valuePaidTo info (buyerAddress params) == Ada.lovelaceValueOf (productPrice $ productDetails params)
+
+    sellerReceived :: Bool
+    sellerReceived = valuePaidTo info (sellerAddress params) == Ada.lovelaceValueOf (productPrice $ productDetails params)
+
+    qualityVerified :: Bool
+    qualityVerified = productVerified $ productDetails params
+
+    allConditionsMet :: Bool
+    allConditionsMet = buyerPaid && sellerReceived && qualityVerified
+
+-- Tipo de contrato
+data AgroIndustry
+instance Scripts.ValidatorTypes AgroIndustry where
+    type instance DatumType AgroIndustry = ()
+    type instance RedeemerType AgroIndustry = ()
+
+-- Instancia del contrato
+typedAgroIndustryValidator :: AgroIndustryParams -> Scripts.TypedValidator AgroIndustry
+typedAgroIndustryValidator params = Scripts.mkTypedValidator @AgroIndustry
+    ($$(PlutusTx.compile [|| mkAgroIndustryValidator ||]) `PlutusTx.applyCode` PlutusTx.liftCode params)
+    $$(PlutusTx.compile [|| wrap ||])
+  where
+    wrap = Scripts.wrapValidator @() @()
+
+-- Definición del contrato inteligente
+agroIndustryValidator :: AgroIndustryParams -> Validator
+agroIndustryValidator = Scripts.validatorScript . typedAgroIndustryValidator
+
+-- Script de hash del contrato
+agroIndustryScriptHash :: AgroIndustryParams -> ValidatorHash
+agroIndustryScriptHash = Scripts.validatorHash . typedAgroIndustryValidator
+
+-- Dirección del contrato
+agroIndustryScriptAddress :: AgroIndustryParams -> Ledger.Address
+agroIndustryScriptAddress = scriptAddress . agroIndustryValidator
+
+-- Contrato para desplegar
+agroIndustryContract :: AgroIndustryParams -> Contract () BlockchainActions Text ()
+agroIndustryContract params = do
+    let val = agroIndustryValidator params
+        tx = Constraints.mustPayToTheScript () (Ada.lovelaceValueOf (productPrice $ productDetails params))
+    ledgerTx <- submitTxConstraints (typedAgroIndustryValidator params) tx
+    void $ awaitTxConfirmed $ txId ledgerTx
+    logInfo @String $ printf "Contrato desplegado correctamente en la dirección %s" (show $ agroIndustryScriptAddress params)
+
+-- Simulación en Plutus Playground
+endpoints :: Contract () BlockchainActions Text ()
+endpoints = do
+    let product = Product "Trigo" 5000000 10 True
+    let params = AgroIndustryParams
+                    { buyerAddress = "Comprador's PkHash"
+                    , sellerAddress = "Vendedor's PkHash"
+                    , productDetails = product
+                    }
+    agroIndustryContract params
+
+mkSchemaDefinitions ''BlockchainActions
+
+$(mkKnownCurrencies [])
